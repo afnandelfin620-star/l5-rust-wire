@@ -97,7 +97,7 @@ pub struct Transport<S> {
     write_notify: std::sync::Arc<tokio::sync::Notify>,
     write_timeout: Option<std::time::Duration>,
     write_timer: Option<Pin<Box<tokio::time::Sleep>>>,
-    waiting_write: bool,
+    write_deadline: Option<tokio::time::Instant>,
     fixed: Option<(crate::fixed::Reader, crate::fixed::Hooks<S>)>,
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
@@ -117,7 +117,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
             write_notify: Default::default(),
             write_timeout: None,
             write_timer: None,
-            waiting_write: false,
+            write_deadline: None,
             fixed: None,
         })
     }
@@ -216,18 +216,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
     pub fn set_write_timeout(&mut self, timeout: std::time::Duration) { self.write_timeout=Some(timeout); }
     fn start_write_wait(&mut self) {
         if let Some(duration)=self.write_timeout {
-            if !self.waiting_write {
-                let deadline=tokio::time::Instant::now()+duration;
-                if let Some(timer)=self.write_timer.as_mut() {timer.as_mut().reset(deadline);}
-                else {self.write_timer=Some(Box::pin(tokio::time::sleep_until(deadline)));}
-                self.waiting_write=true;
-            }
+            if self.write_deadline.is_none() {self.write_deadline=Some(tokio::time::Instant::now()+duration);}
         }
     }
     fn pending_write(&mut self, progress: bool, cx:&mut Context<'_>)->Poll<Result<()>> {
         if let Some(duration)=self.write_timeout {
-            let timer=self.write_timer.as_mut().unwrap();
-            if progress {timer.as_mut().reset(tokio::time::Instant::now()+duration);}
+            if progress {self.write_deadline=Some(tokio::time::Instant::now()+duration);}
+            let deadline=self.write_deadline.unwrap();
+            // No timer allocation in the immediately writable fast path. Reuse
+            // the timer while a batch is blocked, and cancel it after flush.
+            let timer=self.write_timer.get_or_insert_with(||Box::pin(tokio::time::sleep_until(deadline)));
+            timer.as_mut().reset(deadline);
             if timer.as_mut().poll(cx).is_ready() {return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"tunnel write made no progress").into()));}
         }
         Poll::Pending
@@ -243,7 +242,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
                 Poll::Pending=>return self.pending_write(progress,cx),
                 Poll::Ready(result)=>result?,
             }
-            self.waiting_write=false;
+            self.write_deadline=None;
             let completed=self.pending.take().unwrap();
             self.tx.reclaim(completed);
         }
@@ -270,7 +269,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sink<Message> for Transport<S> {
         self.start_write_wait();
         match Pin::new(&mut self.io).poll_flush(cx) {
             Poll::Pending=>self.pending_write(false,cx),
-            Poll::Ready(result)=>{ self.waiting_write=false; Poll::Ready(result.map_err(Into::into)) }
+            Poll::Ready(result)=>{ self.write_deadline=None; self.write_timer=None; Poll::Ready(result.map_err(Into::into)) }
         }
     }
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
