@@ -73,6 +73,8 @@ impl Reader {
         );
         let mut storage = vec![0u8; capacity].into_boxed_slice(); // Once, at connection creation.
         storage[..initial.len()].copy_from_slice(initial);
+        #[cfg(feature = "size-diagnostics")]
+        crate::diagnostics::record(7, capacity);
         Ok(Self {
             storage: Arc::new(storage),
             used: initial.len(),
@@ -233,6 +235,8 @@ impl Reader {
             ready!((hooks.read)(io, cx, &mut read))?;
             let n = read.filled().len();
             poll_ensure!(n > 0, "TLS socket EOF");
+            #[cfg(feature = "size-diagnostics")]
+            crate::diagnostics::record(6, n);
             self.used += n;
         }
     }
@@ -246,6 +250,8 @@ impl Reader {
             .unwrap_or(self.tls_cursor)
             .min(self.tls_cursor);
         ensure!(keep > 0, "message cannot fit fixed receive buffer");
+        #[cfg(feature = "size-diagnostics")]
+        crate::diagnostics::record(8, self.used - keep);
         Arc::get_mut(&mut self.storage)
             .unwrap()
             .copy_within(keep..self.used, 0);

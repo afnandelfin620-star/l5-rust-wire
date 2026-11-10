@@ -12,16 +12,19 @@ pub const LIMITS: [usize; 10] = [
     524288,
     usize::MAX,
 ];
-pub const NAMES: [&str; 6] = [
+pub const NAMES: [&str; 9] = [
     "rx_tcp_full_messages",
     "rx_tcp_pass_messages",
     "rx_control_messages",
     "rx_tls_chunks",
     "req_tcp_deliveries",
     "tx_tcp_messages",
+    "fixed_socket_reads",
+    "fixed_buffer_allocations",
+    "fixed_compactions",
 ];
-static COUNTS: [[AtomicU64; 10]; 6] = [const { [const { AtomicU64::new(0) }; 10] }; 6];
-static BYTES: [[AtomicU64; 10]; 6] = [const { [const { AtomicU64::new(0) }; 10] }; 6];
+static COUNTS: [[AtomicU64; 10]; 9] = [const { [const { AtomicU64::new(0) }; 10] }; 9];
+static BYTES: [[AtomicU64; 10]; 9] = [const { [const { AtomicU64::new(0) }; 10] }; 9];
 pub fn record(kind: usize, len: usize) {
     let bucket = bucket(len);
     COUNTS[kind][bucket].fetch_add(1, Ordering::Relaxed);
@@ -30,7 +33,7 @@ pub fn record(kind: usize, len: usize) {
 fn bucket(len: usize) -> usize {
     LIMITS.iter().position(|&max| len <= max).unwrap()
 }
-pub fn snapshot() -> [([u64; 10], [u64; 10]); 6] {
+pub fn snapshot() -> [([u64; 10], [u64; 10]); 9] {
     std::array::from_fn(|k| {
         (
             std::array::from_fn(|b| COUNTS[k][b].load(Ordering::Relaxed)),
