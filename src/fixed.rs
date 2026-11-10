@@ -18,7 +18,7 @@ use tokio::io::ReadBuf;
 #[derive(Debug, PartialEq, Eq)]
 pub struct Payload {
     storage: Arc<Box<[u8]>>,
-    ranges: Vec<Range<usize>>,
+    ranges: Arc<Vec<Range<usize>>>,
     len: usize,
 }
 impl Payload {
@@ -53,7 +53,7 @@ pub struct Reader {
     header: [u8; HEADER + TAG],
     header_used: usize,
     meta: Option<Meta>,
-    ranges: Vec<Range<usize>>,
+    ranges: Arc<Vec<Range<usize>>>,
     collected: usize,
     keys: Keys,
     seq: u64,
@@ -84,7 +84,7 @@ impl Reader {
             header: [0; HEADER + TAG],
             header_used: 0,
             meta: None,
-            ranges: Vec::new(),
+            ranges: Arc::new(Vec::new()),
             collected: 0,
             keys: keys(root, if client { "server" } else { "client" })?,
             seq: 0,
@@ -132,6 +132,7 @@ impl Reader {
             Arc::strong_count(&self.storage) == 1,
             "previous payload still borrowed"
         );
+        if self.meta.is_none() && self.header_used == 0 { Arc::get_mut(&mut self.ranges).unwrap().clear(); }
         poll_ensure!(self.seq < u64::MAX, "sequence exhausted");
         let mut iterations = 0;
         loop {
@@ -179,7 +180,7 @@ impl Reader {
                 if let Some(m) = self.meta {
                     let total = m.len + if m.mode == Protection::Full { TAG } else { 0 };
                     let n = (total - self.collected).min(range.len());
-                    self.ranges.push(range.start..range.start + n);
+                    Arc::get_mut(&mut self.ranges).unwrap().push(range.start..range.start + n);
                     self.collected += n;
                     range.start += n;
                 } else {
@@ -257,7 +258,7 @@ impl Reader {
             .copy_within(keep..self.used, 0);
         self.used -= keep;
         self.tls_cursor -= keep;
-        for r in &mut self.ranges {
+        for r in Arc::get_mut(&mut self.ranges).unwrap() {
             r.start -= keep;
             r.end -= keep;
         }
@@ -278,7 +279,7 @@ impl Reader {
             let start = self.ranges.first().map(|r| r.start).unwrap_or(0);
             let buffer = Arc::get_mut(&mut self.storage).unwrap();
             let mut end = start;
-            for r in &self.ranges {
+            for r in self.ranges.iter() {
                 if r.start != end {
                     buffer.copy_within(r.clone(), end);
                 }
@@ -292,9 +293,9 @@ impl Reader {
                     &mut buffer[start..end],
                 )
                 .map_err(|_| anyhow::anyhow!("payload authentication failed"))?;
-            self.ranges.clear();
+            Arc::get_mut(&mut self.ranges).unwrap().clear();
             if m.len > 0 {
-                self.ranges.push(start..start + m.len);
+                Arc::get_mut(&mut self.ranges).unwrap().push(start..start + m.len);
             }
         }
         #[cfg(feature = "size-diagnostics")]
@@ -315,7 +316,7 @@ impl Reader {
                 id: m.id,
                 payload: Payload {
                     storage: self.storage.clone(),
-                    ranges: std::mem::take(&mut self.ranges),
+                    ranges: self.ranges.clone(),
                     len: m.len,
                 },
             }
@@ -323,7 +324,7 @@ impl Reader {
             // Control/DNS/UDP messages may outlive the read task. They retain
             // only their small payload, never the 4/8 MiB receive allocation.
             let mut data = Vec::with_capacity(m.len);
-            for r in &self.ranges {
+            for r in self.ranges.iter() {
                 data.extend_from_slice(&self.storage[r.clone()]);
             }
             let b = Bytes::from(data);
@@ -335,7 +336,6 @@ impl Reader {
                 _ => anyhow::bail!("invalid tunnel command"),
             }
         };
-        self.ranges.clear();
         self.meta = None;
         self.header_used = 0;
         self.collected = 0;

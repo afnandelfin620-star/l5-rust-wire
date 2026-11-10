@@ -74,6 +74,7 @@ fn nonce(seq: u64) -> aead::Nonce {
     aead::Nonce::assume_unique_for_key(n)
 }
 pub struct Encoder {
+    scratch: BytesMut,
     keys: Keys,
     seq: u64,
 }
@@ -167,12 +168,21 @@ pub fn codecs(root: &[u8], client: bool) -> Result<(Decoder, Encoder)> {
             streamed: 0,
         },
         Encoder {
-            keys: keys(root, send)?,
+            scratch: BytesMut::new(),            keys: keys(root, send)?,
             seq: 0,
         },
     ))
 }
 impl Encoder {
+    pub(crate) fn reclaim(&mut self, frame: Encoded) {
+        if frame.tag_len != 0 {
+            if let Ok(mut buf) = frame.payload.try_into_mut() {
+                buf.clear();
+                if buf.capacity() > self.scratch.capacity() { self.scratch = buf; }
+            }
+        }
+    }
+
     pub fn prepare(
         &mut self,
         cmd: u8,
@@ -197,9 +207,15 @@ impl Encoder {
             Protection::Full => {
                 // Unique owned Bytes is encrypted in place; immutable pbuf-backed Bytes needs
                 // one copy only when full protection is required. No concatenation buffer.
-                let mut buf = payload
-                    .try_into_mut()
-                    .unwrap_or_else(|b| BytesMut::from(b.as_ref()));
+                let mut buf = match payload.try_into_mut() {
+                    Ok(buf) => buf,
+                    Err(b) => {
+                        let mut buf = std::mem::take(&mut self.scratch);
+                        buf.clear();
+                        buf.extend_from_slice(&b);
+                        buf
+                    }
+                };
                 let tag = self
                     .keys
                     .full

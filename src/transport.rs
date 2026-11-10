@@ -206,7 +206,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
     fn drain(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if let Some(p) = self.pending.as_mut() {
             ready!(p.poll_write(&mut self.io, cx))?;
-            self.pending = None;
+            let completed = self.pending.take().unwrap();
+            self.tx.reclaim(completed);
         }
         Poll::Ready(Ok(()))
     }
