@@ -149,6 +149,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
             }
             Message::Close(_) => (crate::CLOSE, 0, Protection::Full, Bytes::new()),
         };
+        #[cfg(feature = "size-diagnostics")]
+        if cmd == crate::DATA {
+            crate::diagnostics::record(5, payload.len());
+        }
         self.tx.prepare(cmd, id, mode, payload)
     }
     fn drain(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {

@@ -12,3 +12,6 @@ ring = "0.17"
 tokio = { version = "1", features = ["io-util", "time"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[features]
+size-diagnostics = []

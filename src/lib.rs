@@ -1,3 +1,5 @@
+#[cfg(feature = "size-diagnostics")]
+pub mod diagnostics;
 use anyhow::{ensure, Result};
 use bytes::{Bytes, BytesMut};
 use ring::{aead, hkdf};
@@ -393,6 +395,19 @@ impl Decoder {
         Ok(())
     }
     fn finish_owned(&mut self) {
+        #[cfg(feature = "size-diagnostics")]
+        if let Some(m) = self.meta {
+            let kind = if m.cmd == DATA {
+                if m.mode == Protection::Full {
+                    0
+                } else {
+                    1
+                }
+            } else {
+                2
+            };
+            diagnostics::record(kind, m.len);
+        }
         self.meta = None;
         self.used = 0;
         self.seq += 1;
