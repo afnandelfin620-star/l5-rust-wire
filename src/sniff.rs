@@ -1,12 +1,14 @@
 //! Conservative streaming TLS record recognizer. No timers, no payload buffers.
 //! It is NOT a TLS terminator: only record framing and initial hello are inspected.
-//! The entire command payload remains FULL if any byte is not known encrypted.
+//! Detection ends permanently at the first recognized encrypted record.
+//! A chunk containing earlier handshake bytes remains FULL at the transition.
 #[derive(Default)]
 pub struct TlsRecords {
     header: [u8; 5],
     used: usize,
     remaining: usize,
     known: bool,
+    pub(crate) passthrough: bool,
     failed: bool,
     encrypted: bool,
     check_hello: bool,
@@ -14,7 +16,13 @@ pub struct TlsRecords {
     hello_used: usize,
 }
 impl TlsRecords {
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
     pub fn encrypted_chunk(&mut self, mut data: &[u8]) -> bool {
+        if self.passthrough {
+            return true;
+        }
         if self.failed || data.is_empty() {
             return false;
         }
@@ -56,6 +64,13 @@ impl TlsRecords {
                     return false;
                 }
                 self.encrypted = self.known && kind == 23;
+                if self.encrypted {
+                    // This direction is now latched. Do not inspect the rest of
+                    // this chunk or any future record. Earlier handshake bytes
+                    // in this chunk keep THIS command fully protected.
+                    self.passthrough = true;
+                    return all;
+                }
                 all &= self.encrypted;
                 self.remaining = len;
             }
@@ -98,8 +113,8 @@ mod tests {
         let mut c = TlsRecords::default();
         assert!(!c.encrypted_chunk(&hello));
         assert!(c.encrypted_chunk(&encrypted));
-        assert!(!c.encrypted_chunk(b"GET / HTTP/1.1"));
-        assert!(!c.encrypted_chunk(&encrypted));
+        assert!(c.encrypted_chunk(b"opaque continuation; deliberately not parsed"));
+        assert!(c.encrypted_chunk(&encrypted));
         for split in 0..hello.len() {
             let mut c = TlsRecords::default();
             assert!(!c.encrypted_chunk(&hello[..split]));

@@ -25,6 +25,37 @@ impl Message {
         }
     }
 }
+enum Phase {
+    Detecting(TlsRecords),
+    Full,
+    Passthrough,
+}
+struct Session {
+    id: u32,
+    phase: Phase,
+}
+impl Session {
+    fn protection(&mut self, payload: &[u8]) -> Protection {
+        match &mut self.phase {
+            Phase::Passthrough => Protection::TlsPassthrough,
+            Phase::Full => Protection::Full,
+            Phase::Detecting(sniff) => {
+                let pass = sniff.encrypted_chunk(payload);
+                if sniff.passthrough {
+                    self.phase = Phase::Passthrough;
+                } else if sniff.failed() {
+                    self.phase = Phase::Full;
+                }
+                if pass {
+                    Protection::TlsPassthrough
+                } else {
+                    Protection::Full
+                }
+            }
+        }
+    }
+}
+
 /// Transport framing shared by Android and server. No WebSocket codec and no
 /// per-request forwarding task. TLS stream retains its optimized IO buffers.
 pub struct Transport<S> {
@@ -34,7 +65,7 @@ pub struct Transport<S> {
     tx: Encoder,
     pending: Option<Encoded>,
     pongs: VecDeque<Bytes>,
-    classifiers: HashMap<u32, TlsRecords>,
+    classifiers: HashMap<u16, Session>,
     closed: bool,
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
@@ -62,19 +93,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
         t.read_owned = Some(read);
         Ok(t)
     }
+    fn protection(&mut self, id: u32, payload: &[u8]) -> Protection {
+        let slot = self
+            .classifiers
+            .entry(id as u16)
+            .or_insert_with(|| Session {
+                id,
+                phase: Phase::Detecting(TlsRecords::default()),
+            });
+        if slot.id != id {
+            *slot = Session {
+                id,
+                phase: Phase::Detecting(TlsRecords::default()),
+            };
+        }
+        slot.protection(payload)
+    }
+    fn control(&mut self, b: &[u8], outgoing: bool) {
+        if b.len() < 5 {
+            return;
+        }
+        let idx = u16::from_le_bytes([b[1], b[2]]);
+        let id = u32::from(idx) | (u32::from(u16::from_le_bytes([b[3], b[4]])) << 16);
+        if b[0] == 2 {
+            self.classifiers.remove(&idx); // New session, including same-tag reuse.
+        } else if matches!(b[0], 3 | 6) || (outgoing && matches!(b[0], 4 | 5)) {
+            if self.classifiers.get(&idx).is_some_and(|s| s.id == id) {
+                self.classifiers.remove(&idx);
+            }
+        }
+        // Incoming half-close does not reset our independently active direction.
+    }
     fn prepare(&mut self, msg: Message) -> Result<Encoded> {
         let (cmd, id, mode, payload) = match msg {
             Message::Data { id, payload } => {
-                let mode = if self
-                    .classifiers
-                    .entry(id)
-                    .or_default()
-                    .encrypted_chunk(&payload)
-                {
-                    Protection::TlsPassthrough
-                } else {
-                    Protection::Full
-                };
+                let mode = self.protection(id, &payload);
                 (crate::DATA, id, mode, payload)
             }
             Message::Binary(b) => {
@@ -82,19 +135,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
                     let id = u32::from(u16::from_le_bytes([b[1], b[2]]))
                         | (u32::from(u16::from_le_bytes([b[3], b[4]])) << 16);
                     let data = b.slice(5..);
-                    let c = self.classifiers.entry(id).or_default();
-                    let mode = if c.encrypted_chunk(&data) {
-                        Protection::TlsPassthrough
-                    } else {
-                        Protection::Full
-                    };
+                    let mode = self.protection(id, &data);
                     (crate::DATA, id, mode, data)
                 } else {
-                    if b.len() >= 5 && matches!(b[0], 2 | 3 | 6) {
-                        let id = u32::from(u16::from_le_bytes([b[1], b[2]]))
-                            | (u32::from(u16::from_le_bytes([b[3], b[4]])) << 16);
-                        self.classifiers.remove(&id);
-                    }
+                    self.control(&b, true);
                     (crate::L5, 0, Protection::Full, b)
                 }
             }
@@ -168,6 +212,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Transport<S> {
                 return Poll::Ready(Some(Err(e)));
             }
         };
+        if frame.cmd == crate::L5 {
+            self.control(&frame.payload, false);
+        }
         let message = match frame.cmd {
             crate::DATA
                 if self.read_owned.is_some() && frame.protection == Protection::TlsPassthrough =>
@@ -197,5 +244,77 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Transport<S> {
             }
         };
         Poll::Ready(Some(Ok(message)))
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    fn hello() -> Vec<u8> {
+        let mut v = vec![22, 3, 3, 0, 38, 1, 0, 0, 34, 3, 3];
+        v.extend([0; 32]);
+        v
+    }
+    fn control(cmd: u8, id: u32) -> Vec<u8> {
+        vec![
+            cmd,
+            id as u8,
+            (id >> 8) as u8,
+            (id >> 16) as u8,
+            (id >> 24) as u8,
+        ]
+    }
+    fn transport() -> Transport<tokio::io::DuplexStream> {
+        Transport::new(tokio::io::duplex(4096).0, &[1; 32], true).unwrap()
+    }
+    #[test]
+    fn latch_bypasses_parser_and_reuse_resets_both_control_directions() {
+        for outgoing in [true, false] {
+            let mut t = transport();
+            let id = 0x10001;
+            assert_eq!(t.protection(id, &hello()), Protection::Full);
+            assert_eq!(
+                t.protection(id, &[23, 3, 3, 0, 20]),
+                Protection::TlsPassthrough
+            );
+            assert!(matches!(t.classifiers[&1].phase, Phase::Passthrough));
+            for _ in 0..100 {
+                assert_eq!(
+                    t.protection(id, b"not a TLS record; no sniff"),
+                    Protection::TlsPassthrough
+                );
+            }
+            t.control(&control(4, id), false);
+            assert_eq!(t.protection(id, b"body"), Protection::TlsPassthrough);
+            t.control(&control(6, 0x20001), outgoing);
+            assert_eq!(t.protection(id, b"body"), Protection::TlsPassthrough);
+            t.control(&control(3, id), outgoing);
+            assert!(!t.classifiers.contains_key(&1));
+            assert_eq!(t.protection(id, b"GET /"), Protection::Full);
+            t.control(&control(2, id), outgoing);
+            assert_eq!(t.protection(id, &hello()), Protection::Full);
+            assert_eq!(
+                t.protection(id, &[23, 3, 3, 0, 20]),
+                Protection::TlsPassthrough
+            );
+            assert_eq!(t.protection(0x20001, b"GET /"), Protection::Full);
+            assert_eq!(t.classifiers.len(), 1);
+        }
+    }
+    #[test]
+    fn mixed_transition_and_opposite_direction_stay_protected() {
+        let mut t = transport();
+        let mut other = transport();
+        let id = 7;
+        let mut mixed = hello();
+        mixed.extend([23, 3, 3, 0, 20]);
+        mixed.extend([8; 20]);
+        assert_eq!(t.protection(id, &mixed), Protection::Full);
+        assert_eq!(
+            t.protection(id, b"continuation"),
+            Protection::TlsPassthrough
+        );
+        assert_eq!(other.protection(id, b"plaintext"), Protection::Full);
+        assert_eq!(other.protection(id, &mixed), Protection::Full);
     }
 }

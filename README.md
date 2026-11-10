@@ -50,3 +50,9 @@ new_owned 接受调用方提供的读取 Bytes 回调，不绑定 TLS 实现。�
 ## 提交范围
 
 提交 Cargo.toml、Cargo.lock、README.md、.gitignore、src/、tests/。此目录不含部署密钥、认证配置或服务端 vendor 源码。客户端和服务端的最终 Git URL/rev 接入待仓库创建后完成。
+
+## Session-based TCP passthrough
+
+Each transport tracks its sending direction independently, keyed by req slot and generation tag. Detecting transitions permanently to Passthrough after recognizing the first encrypted TLS application record (TLS 1.2/1.3 record format). Future payloads bypass the sniffer entirely. A transition chunk containing prior plaintext remains FULL; subsequent chunks pass through. Unknown/invalid streams latch FULL. This assumes a recognized session continues carrying ciphertext; subsequent plaintext is not re-detected. Command headers remain AES-GCM protected. UDP remains FULL, not falsely treated as TCP TLS.
+
+Create, full close, outgoing half-close and slot/tag reuse reset the appropriate sending state. Incoming half-close preserves the independent opposite direction. Authenticated incoming lifecycle commands also clean up state. Payload ownership and receive decoding are unchanged.
