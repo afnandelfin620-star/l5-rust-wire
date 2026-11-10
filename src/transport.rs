@@ -94,6 +94,10 @@ pub struct Transport<S> {
     classifiers: HashMap<u16, Session>,
     closed: bool,
     receive_chunks: Vec<Bytes>,
+    write_notify: std::sync::Arc<tokio::sync::Notify>,
+    write_timeout: Option<std::time::Duration>,
+    write_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    waiting_write: bool,
     fixed: Option<(crate::fixed::Reader, crate::fixed::Hooks<S>)>,
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
@@ -110,6 +114,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
             classifiers: HashMap::new(),
             closed: false,
             receive_chunks: Vec::new(),
+            write_notify: Default::default(),
+            write_timeout: None,
+            write_timer: None,
+            waiting_write: false,
             fixed: None,
         })
     }
@@ -203,14 +211,45 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
         }
         self.tx.prepare(cmd, id, mode, payload)
     }
+    pub fn write_notify(&self) -> std::sync::Arc<tokio::sync::Notify> { self.write_notify.clone() }
+    pub fn set_write_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) { self.write_notify=notify; }
+    pub fn set_write_timeout(&mut self, timeout: std::time::Duration) { self.write_timeout=Some(timeout); }
+    fn start_write_wait(&mut self) {
+        if let Some(duration)=self.write_timeout {
+            if !self.waiting_write {
+                let deadline=tokio::time::Instant::now()+duration;
+                if let Some(timer)=self.write_timer.as_mut() {timer.as_mut().reset(deadline);}
+                else {self.write_timer=Some(Box::pin(tokio::time::sleep_until(deadline)));}
+                self.waiting_write=true;
+            }
+        }
+    }
+    fn pending_write(&mut self, progress: bool, cx:&mut Context<'_>)->Poll<Result<()>> {
+        if let Some(duration)=self.write_timeout {
+            let timer=self.write_timer.as_mut().unwrap();
+            if progress {timer.as_mut().reset(tokio::time::Instant::now()+duration);}
+            if timer.as_mut().poll(cx).is_ready() {return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"tunnel write made no progress").into()));}
+        }
+        Poll::Pending
+    }
     fn drain(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if let Some(p) = self.pending.as_mut() {
-            ready!(p.poll_write(&mut self.io, cx))?;
-            let completed = self.pending.take().unwrap();
+        if self.pending.is_some() {
+            self.start_write_wait();
+            let p=self.pending.as_mut().unwrap();
+            let before=p.written();
+            let result=p.poll_write(&mut self.io,cx);
+            let progress=p.written()!=before;
+            match result {
+                Poll::Pending=>return self.pending_write(progress,cx),
+                Poll::Ready(result)=>result?,
+            }
+            self.waiting_write=false;
+            let completed=self.pending.take().unwrap();
             self.tx.reclaim(completed);
         }
         Poll::Ready(Ok(()))
     }
+
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> Sink<Message> for Transport<S> {
     type Error = anyhow::Error;
@@ -228,7 +267,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sink<Message> for Transport<S> {
             self.pending = Some(self.prepare(Message::Pong(pong))?);
             ready!(self.drain(cx))?;
         }
-        Poll::Ready(ready!(Pin::new(&mut self.io).poll_flush(cx)).map_err(Into::into))
+        self.start_write_wait();
+        match Pin::new(&mut self.io).poll_flush(cx) {
+            Poll::Pending=>self.pending_write(false,cx),
+            Poll::Ready(result)=>{ self.waiting_write=false; Poll::Ready(result.map_err(Into::into)) }
+        }
     }
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         ready!(self.as_mut().poll_flush(cx))?;
@@ -240,12 +283,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Transport<S> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.closed {
             return Poll::Ready(None);
-        }
-        if !self.pongs.is_empty() {
-            if let Err(e) = ready!(self.as_mut().poll_flush(cx)) {
-                self.closed = true;
-                return Poll::Ready(Some(Err(e)));
-            }
         }
         if self.fixed.is_some() {
             let result = {
@@ -268,6 +305,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Transport<S> {
                         return Poll::Ready(Some(Err(anyhow::anyhow!("too many pings"))));
                     }
                     self.pongs.push_back(b.clone());
+                    self.write_notify.notify_one();
                 }
                 Message::Close(_) => self.closed = true,
                 _ => {}
@@ -327,6 +365,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Transport<S> {
                         return Poll::Ready(Some(Err(anyhow::anyhow!("too many pings"))));
                     }
                     self.pongs.push_back(frame.payload.clone());
+                    self.write_notify.notify_one();
                     Message::Ping(frame.payload)
                 }
                 crate::PONG => Message::Pong(frame.payload),

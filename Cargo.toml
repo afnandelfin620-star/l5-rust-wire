@@ -9,9 +9,9 @@ anyhow = "1"
 bytes = "1"
 futures = "0.3"
 ring = "0.17"
-tokio = { version = "1", features = ["io-util", "time"] }
+tokio = { version = "1", features = ["io-util", "time", "sync"] }
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
 
 [features]
 size-diagnostics = []

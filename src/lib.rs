@@ -106,6 +106,7 @@ pub struct Encoded {
     offset: usize,
 }
 impl Encoded {
+    pub(crate) fn written(&self) -> usize { self.offset }
     pub fn poll_write<S: AsyncWrite + Unpin>(
         &mut self,
         s: &mut S,
