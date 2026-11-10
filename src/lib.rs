@@ -264,6 +264,9 @@ impl Encoder {
     }
 }
 impl Decoder {
+    pub(crate) fn frame_complete(&self) -> bool {
+        self.meta.is_none()
+    }
     /// Owned receive path: keep TLS slab ownership through L5 parsing. Only the
     /// 36-byte authenticated header is gathered. Passthrough DATA is delivered as
     /// slices (possibly several for one wire frame); full AEAD waits for its tag.

@@ -12,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[derive(Debug, PartialEq, Eq)]
 pub enum Message {
     Data { id: u32, payload: Bytes },
+    DataChunks { id: u32, chunks: Vec<Bytes> },
     Binary(Bytes),
     Ping(Bytes),
     Pong(Bytes),
@@ -21,6 +22,14 @@ impl Message {
     pub fn into_data(self) -> Bytes {
         match self {
             Self::Binary(b) | Self::Ping(b) | Self::Pong(b) | Self::Data { payload: b, .. } => b,
+            Self::DataChunks { chunks, .. } => {
+                // Convenience conversion only. Production consumers use vectored writes.
+                let mut b = bytes::BytesMut::with_capacity(chunks.iter().map(Bytes::len).sum());
+                for c in chunks {
+                    b.extend_from_slice(&c);
+                }
+                b.freeze()
+            }
             Self::Close(_) => Bytes::new(),
         }
     }
@@ -67,6 +76,7 @@ pub struct Transport<S> {
     pongs: VecDeque<Bytes>,
     classifiers: HashMap<u16, Session>,
     closed: bool,
+    receive_chunks: Vec<Bytes>,
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
     pub fn new(io: S, root: &[u8], client: bool) -> Result<Self> {
@@ -81,6 +91,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
             pongs: VecDeque::new(),
             classifiers: HashMap::new(),
             closed: false,
+            receive_chunks: Vec::new(),
         })
     }
     pub fn new_owned(
@@ -126,6 +137,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
     }
     fn prepare(&mut self, msg: Message) -> Result<Encoded> {
         let (cmd, id, mode, payload) = match msg {
+            Message::DataChunks { .. } => {
+                anyhow::bail!("DataChunks is a receive-only complete frame")
+            }
             Message::Data { id, payload } => {
                 let mode = self.protection(id, &payload);
                 (crate::DATA, id, mode, payload)
@@ -198,56 +212,73 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Transport<S> {
                 return Poll::Ready(Some(Err(e)));
             }
         }
-        let result = {
-            let this = &mut *self;
-            let fut = async {
-                match this.read_owned {
-                    Some(read) => this.rx.read_owned(&mut this.io, read).await,
-                    None => this.rx.read(&mut this.io).await,
+        let mut slices_this_poll = 0;
+        loop {
+            let result = {
+                let this = &mut *self;
+                let fut = async {
+                    match this.read_owned {
+                        Some(read) => this.rx.read_owned(&mut this.io, read).await,
+                        None => this.rx.read(&mut this.io).await,
+                    }
+                };
+                tokio::pin!(fut);
+                ready!(fut.poll(cx))
+            };
+            let frame = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.closed = true;
+                    self.receive_chunks.clear();
+                    return Poll::Ready(Some(Err(e)));
                 }
             };
-            tokio::pin!(fut);
-            ready!(fut.poll(cx))
-        };
-        let frame = match result {
-            Ok(m) => m,
-            Err(e) => {
-                self.closed = true;
-                return Poll::Ready(Some(Err(e)));
+            if frame.cmd == crate::L5 {
+                self.control(&frame.payload, false);
             }
-        };
-        if frame.cmd == crate::L5 {
-            self.control(&frame.payload, false);
-        }
-        let message = match frame.cmd {
-            crate::DATA
-                if self.read_owned.is_some() && frame.protection == Protection::TlsPassthrough =>
-            {
-                Message::Data {
-                    id: frame.id,
-                    payload: frame.payload,
+            let message = match frame.cmd {
+                crate::DATA
+                    if self.read_owned.is_some()
+                        && frame.protection == Protection::TlsPassthrough =>
+                {
+                    if !frame.payload.is_empty() {
+                        self.receive_chunks.push(frame.payload);
+                    }
+                    if !self.rx.frame_complete() {
+                        slices_this_poll += 1;
+                        if slices_this_poll >= 64 {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        continue;
+                    }
+                    // Preserve all receive slab owners; gather descriptors, not bytes.
+                    Message::DataChunks {
+                        id: frame.id,
+                        chunks: std::mem::take(&mut self.receive_chunks),
+                    }
                 }
-            }
-            crate::DATA | crate::L5 => Message::Binary(frame.payload),
-            crate::PING => {
-                if self.pongs.len() >= 32 {
+                crate::DATA | crate::L5 => Message::Binary(frame.payload),
+                crate::PING => {
+                    if self.pongs.len() >= 32 {
+                        self.closed = true;
+                        return Poll::Ready(Some(Err(anyhow::anyhow!("too many pings"))));
+                    }
+                    self.pongs.push_back(frame.payload.clone());
+                    Message::Ping(frame.payload)
+                }
+                crate::PONG => Message::Pong(frame.payload),
+                crate::CLOSE => {
                     self.closed = true;
-                    return Poll::Ready(Some(Err(anyhow::anyhow!("too many pings"))));
+                    Message::Close(None)
                 }
-                self.pongs.push_back(frame.payload.clone());
-                Message::Ping(frame.payload)
-            }
-            crate::PONG => Message::Pong(frame.payload),
-            crate::CLOSE => {
-                self.closed = true;
-                Message::Close(None)
-            }
-            _ => {
-                self.closed = true;
-                return Poll::Ready(Some(Err(anyhow::anyhow!("invalid tunnel command"))));
-            }
-        };
-        Poll::Ready(Some(Ok(message)))
+                _ => {
+                    self.closed = true;
+                    return Poll::Ready(Some(Err(anyhow::anyhow!("invalid tunnel command"))));
+                }
+            };
+            return Poll::Ready(Some(Ok(message)));
+        }
     }
 }
 
