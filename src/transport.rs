@@ -261,7 +261,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
 impl<S: AsyncRead + AsyncWrite + Unpin> Sink<Message> for Transport<S> {
     type Error = anyhow::Error;
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        self.drain_controls(cx)
+        self.drain(cx)
     }
     fn start_send(mut self: Pin<&mut Self>, msg: Message) -> Result<()> {
         ensure!(self.pending.is_none(), "sink not ready");
