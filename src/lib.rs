@@ -530,3 +530,22 @@ impl Decoder {
         })
     }
 }
+
+#[cfg(test)]
+mod scratch_reuse_tests {
+    use super::*;
+    #[test]
+    fn immutable_full_payload_reuses_encryption_storage() {
+        let (_,mut encoder)=codecs(&[9;32],true).unwrap();
+        let input=Bytes::from(vec![7;MAX_PAYLOAD]);
+        let mut address=None;
+        for _ in 0..100 {
+            // Retain input so the FULL encoder cannot mutate it.
+            let frame=encoder.prepare(DATA,1,Protection::Full,input.clone()).unwrap();
+            if let Some(ptr)=address {assert_eq!(frame.payload.as_ptr(),ptr);}
+            address=Some(frame.payload.as_ptr());
+            encoder.reclaim(frame);
+            assert!(input.iter().all(|b|*b==7));
+        }
+    }
+}
