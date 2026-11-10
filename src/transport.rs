@@ -231,6 +231,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
         }
         Poll::Pending
     }
+    fn drain_controls(&mut self,cx:&mut Context<'_>)->Poll<Result<()>> {
+        ready!(self.drain(cx))?;
+        while let Some(pong)=self.pongs.pop_front() {
+            self.pending=Some(self.prepare(Message::Pong(pong))?);
+            ready!(self.drain(cx))?;
+        }
+        Poll::Ready(Ok(()))
+    }
     fn drain(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.pending.is_some() {
             self.start_write_wait();
@@ -253,7 +261,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
 impl<S: AsyncRead + AsyncWrite + Unpin> Sink<Message> for Transport<S> {
     type Error = anyhow::Error;
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        self.drain(cx)
+        self.drain_controls(cx)
     }
     fn start_send(mut self: Pin<&mut Self>, msg: Message) -> Result<()> {
         ensure!(self.pending.is_none(), "sink not ready");
@@ -261,11 +269,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sink<Message> for Transport<S> {
         Ok(())
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        ready!(self.drain(cx))?;
-        while let Some(pong) = self.pongs.pop_front() {
-            self.pending = Some(self.prepare(Message::Pong(pong))?);
-            ready!(self.drain(cx))?;
-        }
+        ready!(self.drain_controls(cx))?;
         self.start_write_wait();
         match Pin::new(&mut self.io).poll_flush(cx) {
             Poll::Pending=>self.pending_write(false,cx),
