@@ -1,0 +1,14 @@
+[package]
+name = "l5-wire"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Shared L5 tunnel framing, payload protection and streaming transport"
+[dependencies]
+anyhow = "1"
+bytes = "1"
+futures = "0.3"
+ring = "0.17"
+tokio = { version = "1", features = ["io-util", "time"] }
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }
