@@ -9,6 +9,7 @@ use std::{
     task::{ready, Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+pub mod fixed;
 pub mod sniff;
 pub mod transport;
 pub const MODE: &str = "l5-android-v2";
@@ -21,7 +22,8 @@ pub const CLOSE: u8 = 6;
 pub const L5: u8 = 7;
 pub const PING: u8 = 8;
 pub const PONG: u8 = 9;
-pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+/// Maximum payload of one L5 command; IO capacity is not message capacity.
+pub const MAX_PAYLOAD: usize = 256 * 1024;
 const HEADER: usize = 20;
 const TAG: usize = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

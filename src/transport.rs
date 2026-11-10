@@ -11,8 +11,18 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite};
 #[derive(Debug, PartialEq, Eq)]
 pub enum Message {
-    Data { id: u32, payload: Bytes },
-    DataChunks { id: u32, chunks: Vec<Bytes> },
+    DataFrame {
+        id: u32,
+        payload: crate::fixed::Payload,
+    },
+    Data {
+        id: u32,
+        payload: Bytes,
+    },
+    DataChunks {
+        id: u32,
+        chunks: Vec<Bytes>,
+    },
     Binary(Bytes),
     Ping(Bytes),
     Pong(Bytes),
@@ -22,6 +32,13 @@ impl Message {
     pub fn into_data(self) -> Bytes {
         match self {
             Self::Binary(b) | Self::Ping(b) | Self::Pong(b) | Self::Data { payload: b, .. } => b,
+            Self::DataFrame { payload, .. } => {
+                let mut b = bytes::BytesMut::with_capacity(payload.len());
+                for c in payload.chunks() {
+                    b.extend_from_slice(c);
+                }
+                b.freeze()
+            }
             Self::DataChunks { chunks, .. } => {
                 // Convenience conversion only. Production consumers use vectored writes.
                 let mut b = bytes::BytesMut::with_capacity(chunks.iter().map(Bytes::len).sum());
@@ -77,6 +94,7 @@ pub struct Transport<S> {
     classifiers: HashMap<u16, Session>,
     closed: bool,
     receive_chunks: Vec<Bytes>,
+    fixed: Option<(crate::fixed::Reader, crate::fixed::Hooks<S>)>,
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
     pub fn new(io: S, root: &[u8], client: bool) -> Result<Self> {
@@ -92,6 +110,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
             classifiers: HashMap::new(),
             closed: false,
             receive_chunks: Vec::new(),
+            fixed: None,
         })
     }
     pub fn new_owned(
@@ -102,6 +121,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
     ) -> Result<Self> {
         let mut t = Self::new(io, root, client)?;
         t.read_owned = Some(read);
+        Ok(t)
+    }
+    pub fn new_fixed(
+        io: S,
+        root: &[u8],
+        client: bool,
+        capacity: usize,
+        initial: &[u8],
+        hooks: crate::fixed::Hooks<S>,
+    ) -> Result<Self> {
+        let mut t = Self::new(io, root, client)?;
+        t.fixed = Some((
+            crate::fixed::Reader::new(root, client, capacity, initial)?,
+            hooks,
+        ));
         Ok(t)
     }
     fn protection(&mut self, id: u32, payload: &[u8]) -> Protection {
@@ -137,7 +171,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
     }
     fn prepare(&mut self, msg: Message) -> Result<Encoded> {
         let (cmd, id, mode, payload) = match msg {
-            Message::DataChunks { .. } => {
+            Message::DataFrame { .. } | Message::DataChunks { .. } => {
                 anyhow::bail!("DataChunks is a receive-only complete frame")
             }
             Message::Data { id, payload } => {
@@ -211,6 +245,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Transport<S> {
                 self.closed = true;
                 return Poll::Ready(Some(Err(e)));
             }
+        }
+        if self.fixed.is_some() {
+            let result = {
+                let this = &mut *self;
+                let (reader, hooks) = this.fixed.as_mut().unwrap();
+                ready!(reader.poll_next(&mut this.io, hooks, cx))
+            };
+            let message = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.closed = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+            };
+            match &message {
+                Message::Binary(b) => self.control(b, false),
+                Message::Ping(b) => {
+                    if self.pongs.len() >= 32 {
+                        self.closed = true;
+                        return Poll::Ready(Some(Err(anyhow::anyhow!("too many pings"))));
+                    }
+                    self.pongs.push_back(b.clone());
+                }
+                Message::Close(_) => self.closed = true,
+                _ => {}
+            }
+            return Poll::Ready(Some(Ok(message)));
         }
         let mut slices_this_poll = 0;
         loop {

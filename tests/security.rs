@@ -106,3 +106,18 @@ async fn raw_payload_has_no_tag_but_full_payload_is_authenticated() {
         assert!(rx.read(&mut &wire[..wire.len() - 1]).await.is_err());
     }
 }
+
+#[test]
+fn command_payload_limit_is_256_kib_not_io_buffer_capacity() {
+    use l5_wire::MAX_PAYLOAD;
+    assert_eq!(MAX_PAYLOAD, 256 * 1024);
+    let (_, mut tx) = codecs(&[7; 32], true).unwrap();
+    for mode in [Protection::Full, Protection::TlsPassthrough] {
+        assert!(tx
+            .prepare(DATA, 1, mode, Bytes::from(vec![0; MAX_PAYLOAD]))
+            .is_ok());
+        assert!(tx
+            .prepare(DATA, 1, mode, Bytes::from(vec![0; MAX_PAYLOAD + 1]))
+            .is_err());
+    }
+}
