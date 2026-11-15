@@ -1,4 +1,4 @@
-use crate::{sniff::TlsRecords, Decoder, Encoded, Encoder, Layout, Protection};
+use crate::{sniff::{Hello, TlsRecords}, Decoder, Encoded, Encoder, Layout, Protection};
 use anyhow::{ensure, Result};
 use bytes::Bytes;
 use futures::{Sink, Stream};
@@ -59,13 +59,38 @@ enum Phase {
 struct Session {
     id: u32,
     phase: Phase,
+    /// ServerHello verdict for this request, from whichever direction carries
+    /// it (the client receives it; the server sends it). Passthrough requires
+    /// `Some(true)`: negotiated TLS 1.3 with a 16-byte-tag AEAD suite.
+    tls13: Option<bool>,
+    /// Receive-direction scanner, dropped once its first handshake message is known.
+    rx: Option<TlsRecords>,
 }
 impl Session {
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            phase: Phase::Records(TlsRecords::default()),
+            tls13: None,
+            rx: Some(TlsRecords::default()),
+        }
+    }
+    /// Received request bytes: look only for the ServerHello, then stop.
+    fn observe(&mut self, data: &[u8]) {
+        if self.tls13.is_some() {
+            self.rx = None;
+        }
+        let Some(rx) = &mut self.rx else { return };
+        rx.classify(data, &mut self.tls13);
+        if rx.failed() || rx.hello() != Hello::Pending || self.tls13.is_some() {
+            self.rx = None;
+        }
+    }
     fn protection(&mut self, payload: &[u8]) -> (Protection, Layout) {
         match &mut self.phase {
             Phase::Full => (Protection::Full, Layout::default()),
             Phase::Records(records) => {
-                let (pass, layout) = records.classify(payload);
+                let (pass, layout) = records.classify(payload, &mut self.tls13);
                 if records.failed() {
                     self.phase = Phase::Full;
                 }
@@ -147,17 +172,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
         let slot = self
             .classifiers
             .entry(id as u16)
-            .or_insert_with(|| Session {
-                id,
-                phase: Phase::Records(TlsRecords::default()),
-            });
+            .or_insert_with(|| Session::new(id));
         if slot.id != id {
-            *slot = Session {
-                id,
-                phase: Phase::Records(TlsRecords::default()),
-            };
+            *slot = Session::new(id);
         }
         slot.protection(payload)
+    }
+    /// Received DATA for request `id`. Never replaces a newer session on the
+    /// same slot: late frames of a retired request are ignored.
+    fn observe(&mut self, id: u32, data: &[u8]) {
+        let slot = self
+            .classifiers
+            .entry(id as u16)
+            .or_insert_with(|| Session::new(id));
+        if slot.id == id {
+            slot.observe(data);
+        }
     }
     fn control(&mut self, b: &[u8], outgoing: bool) {
         if b.len() < 5 {
@@ -298,6 +328,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Transport<S> {
                 }
             };
             match &message {
+                Message::DataFrame { id, payload } => {
+                    for chunk in payload.chunks() {
+                        self.observe(*id, chunk);
+                    }
+                }
                 Message::Binary(b) => self.control(b, false),
                 Message::Ping(b) => {
                     if self.pongs.len() >= 32 {
@@ -335,6 +370,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Transport<S> {
             };
             if frame.cmd == crate::L5 {
                 self.control(&frame.payload, false);
+            } else if frame.cmd == crate::DATA {
+                // Legacy DATA carries a 5-byte request prefix, except streamed
+                // or gathered passthrough on the owned path.
+                let prefix = if self.read_owned.is_none() || frame.protection == Protection::Full { 5 } else { 0 };
+                if frame.payload.len() >= prefix {
+                    let data = frame.payload.slice(prefix..);
+                    self.observe(frame.id, &data);
+                }
             }
             let message = match frame.cmd {
                 crate::DATA
@@ -386,6 +429,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Transport<S> {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+    use crate::sniff::tests::server_hello;
     fn hello() -> Vec<u8> {
         let mut v = vec![22, 3, 3, 0, 38, 1, 0, 0, 34, 3, 3];
         v.extend([0; 32]);
@@ -417,6 +461,7 @@ mod session_tests {
             let mut t = transport();
             let id = 0x10001;
             assert_eq!(mode(&mut t, id, &hello()), Protection::Full);
+            t.observe(id, &server_hello());
             assert_eq!(
                 t.protection(id, &[23, 3, 3, 0, 20]),
                 (Protection::TlsPassthrough, Layout { cont: 0, skip: Some(0) })
@@ -439,7 +484,10 @@ mod session_tests {
             assert_eq!(mode(&mut t, id, b"GET /"), Protection::Full);
             t.control(&control(2, id), outgoing);
             assert_eq!(mode(&mut t, id, &hello()), Protection::Full);
-            assert_eq!(mode(&mut t, id, &[23, 3, 3, 0, 20]), Protection::TlsPassthrough);
+            // A new request needs its own ServerHello verdict.
+            assert_eq!(mode(&mut t, id, &rec(20)), Protection::Full);
+            t.observe(id, &server_hello());
+            assert_eq!(mode(&mut t, id, &rec(20)), Protection::TlsPassthrough);
             assert_eq!(mode(&mut t, 0x20001, b"GET /"), Protection::Full);
             assert_eq!(t.classifiers.len(), 1);
         }
@@ -448,6 +496,7 @@ mod session_tests {
     fn framing_violation_after_latch_falls_back_to_full() {
         let mut t = transport();
         assert_eq!(mode(&mut t, 1, &hello()), Protection::Full);
+        t.observe(1, &server_hello());
         assert_eq!(mode(&mut t, 1, &rec(20)), Protection::TlsPassthrough);
         assert_eq!(mode(&mut t, 1, b"not a TLS record; no sniff"), Protection::Full);
         assert!(matches!(t.classifiers[&1].phase, Phase::Full));
@@ -461,6 +510,7 @@ mod session_tests {
         let mut mixed = hello();
         mixed.extend([23, 3, 3, 0, 20]);
         mixed.extend([8; 10]);
+        t.observe(id, &server_hello());
         assert_eq!(mode(&mut t, id, &mixed), Protection::Full);
         let mut rest = vec![8; 10];
         rest.extend(rec(18));
