@@ -6,7 +6,7 @@ async fn authenticate_modes_replay_tamper_and_cross_frame_substitution() {
         let (_, mut tx) = codecs(&[7; 32], true).unwrap();
         let first = tx.encode(DATA, 10, mode, b"secret payload").unwrap();
         let second = tx.encode(DATA, 11, mode, b"second payload").unwrap();
-        for at in [0, 1, 2, 19, 20, 35] {
+        for at in [0, 1, 2, 23, 24, 39] {
             let (mut rx, _) = codecs(&[7; 32], false).unwrap();
             let mut bad = first.clone();
             bad[at] ^= 1;
@@ -21,7 +21,7 @@ async fn authenticate_modes_replay_tamper_and_cross_frame_substitution() {
         assert!(rx.read(&mut &first[..]).await.is_err());
         let (mut rx, _) = codecs(&[7; 32], false).unwrap();
         let mut swapped = first.clone();
-        swapped[36..].copy_from_slice(&second[36..]);
+        swapped[40..].copy_from_slice(&second[40..]);
         if mode == Protection::Full {
             assert!(rx.read(&mut &swapped[..]).await.is_err());
         } else {
@@ -92,10 +92,10 @@ async fn raw_payload_has_no_tag_but_full_payload_is_authenticated() {
         let wire = tx.encode(DATA, 1, mode, b"payload").unwrap();
         assert_eq!(
             wire.len(),
-            36 + 7 + if mode == Protection::Full { 16 } else { 0 }
+            40 + 7 + if mode == Protection::Full { 16 } else { 0 }
         );
         let mut corrupted = wire.clone();
-        corrupted[36] ^= 1;
+        corrupted[40] ^= 1;
         let (mut rx, _) = codecs(&[7; 32], false).unwrap();
         if mode == Protection::Full {
             assert!(rx.read(&mut &corrupted[..]).await.is_err());

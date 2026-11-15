@@ -77,7 +77,7 @@ async fn complete_once_zero_copy_pending_and_fin_order() {
     assert_eq!(id, 91);
     let mut offset = 0;
     for c in &chunks {
-        assert_eq!(c.as_ptr() as usize, base + 36 + offset);
+        assert_eq!(c.as_ptr() as usize, base + 40 + offset);
         assert!(c.iter().all(|b| *b == 7));
         offset += c.len();
     }

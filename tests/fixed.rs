@@ -69,7 +69,7 @@ impl AsyncWrite for Input {
 fn records(wire: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     for b in wire.chunks(16384) {
-        out.extend([126, 3, 3, (b.len() >> 8) as u8, b.len() as u8]);
+        out.extend([23, 3, 3, (b.len() >> 8) as u8, b.len() as u8]);
         out.extend_from_slice(b);
     }
     out

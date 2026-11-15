@@ -2,7 +2,7 @@
 //! receive-buffer growth. Payload leases prevent the next read until delivery
 //! finishes; the same allocation is reclaimed, never replaced.
 use crate::transport::Message;
-use crate::{keys, nonce, Keys, Protection, DATA, HEADER, MAX_PAYLOAD, TAG};
+use crate::{header_mask, keys, nonce, parse_layout, record_len, walk_headers, Keys, Layout, Protection, DATA, HEADER, MAX_PAYLOAD, TAG};
 use anyhow::{ensure, Result};
 use bytes::Bytes;
 use ring::aead;
@@ -43,6 +43,7 @@ struct Meta {
     id: u32,
     mode: Protection,
     len: usize,
+    layout: Layout,
 }
 pub struct Reader {
     storage: Arc<Box<[u8]>>,
@@ -142,7 +143,7 @@ impl Reader {
                     .header
                     .open_in_place(nonce(self.seq), aead::Aad::empty(), &mut self.header)
                     .map_err(|_| anyhow::anyhow!("header authentication failed"))?;
-                poll_ensure!(h[0] == 2 && h[3] == 0, "frame version/reserved");
+                poll_ensure!(h[0] == 2, "frame version");
                 poll_ensure!(
                     u64::from_be_bytes(h[8..16].try_into()?) == self.seq,
                     "sequence mismatch"
@@ -163,11 +164,13 @@ impl Reader {
                 );
                 let len = u32::from_be_bytes(h[16..20].try_into()?) as usize;
                 poll_ensure!(len <= MAX_PAYLOAD, "oversized frame");
+                let layout = parse_layout(h, mode, len)?;
                 self.meta = Some(Meta {
                     cmd,
                     id: u32::from_be_bytes(h[4..8].try_into()?),
                     mode,
                     len,
+                    layout,
                 });
             }
             if let Some(m) = self.meta {
@@ -272,8 +275,41 @@ impl Reader {
         }
         Ok(())
     }
-    fn finish(&mut self, m: Meta) -> Result<Message> {
-        if m.mode == Protection::Full {
+    /// Unmask inner TLS record headers in place across the payload ranges of
+    /// this receive buffer. Touches 5 bytes per inner record; no payload copy.
+    fn unmask(&mut self, layout: Layout) -> Result<()> {
+        let storage = Arc::get_mut(&mut self.storage).unwrap();
+        let ranges = &self.ranges;
+        let len: usize = ranges.iter().map(|r| r.len()).sum();
+        // Map a logical payload offset to a storage index.
+        let locate = |mut off: usize| -> usize {
+            for r in ranges.iter() {
+                if off < r.len() {
+                    return r.start + off;
+                }
+                off -= r.len();
+            }
+            unreachable!("offset inside payload")
+        };
+        let (key, seq) = (&self.keys.mask, self.seq);
+        let mut failure = None;
+        walk_headers(layout, len, |p, c| {
+            let mut h = [0u8; 5];
+            match header_mask(key, seq, p) {
+                Ok(m) => {
+                    for i in 0..c {
+                        let at = locate(p + i);
+                        storage[at] ^= m[i];
+                        h[i] = storage[at];
+                    }
+                }
+                Err(e) => failure = Some(e),
+            }
+            if c == 5 { record_len(&h) } else { 0 }
+        });
+        failure.map_or(Ok(()), Err)
+    }
+    fn finish(&mut self, m: Meta) -> Result<Message> {        if m.mode == Protection::Full {
             // GCM requires contiguous mutable ciphertext. Only FULL messages
             // gather in place in this SAME buffer; passthrough never does.
             let start = self.ranges.first().map(|r| r.start).unwrap_or(0);
@@ -297,6 +333,9 @@ impl Reader {
             if m.len > 0 {
                 Arc::get_mut(&mut self.ranges).unwrap().push(start..start + m.len);
             }
+        }
+        if m.mode == Protection::TlsPassthrough && !m.layout.is_empty() {
+            self.unmask(m.layout)?;
         }
         #[cfg(feature = "size-diagnostics")]
         crate::diagnostics::record(

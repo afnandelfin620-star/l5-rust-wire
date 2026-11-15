@@ -22,7 +22,7 @@ fn read(input: &mut Input, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
 }
 #[tokio::test]
 async fn shared_payload_no_copy_and_full_frames_authenticated() {
-    for split in [1, 5, 35, 36, 37, 16384, 65536] {
+    for split in [1, 5, 39, 40, 41, 16384, 65536] {
         let (mut rx, _) = codecs(&[9; 32], false).unwrap();
         let (_, mut tx) = codecs(&[9; 32], true).unwrap();
         let payload = vec![0x83; 65539];
@@ -52,7 +52,7 @@ async fn shared_payload_no_copy_and_full_frames_authenticated() {
             .unwrap();
             assert_eq!(m.cmd, DATA);
             assert_eq!(m.id, 42);
-            assert_eq!(m.payload.as_ptr() as usize, base + 36 + offset);
+            assert_eq!(m.payload.as_ptr() as usize, base + 40 + offset);
             assert!(m.payload.iter().all(|b| *b == 0x83));
             offset += m.payload.len();
             held.push(m.payload);
@@ -95,7 +95,7 @@ async fn shared_header_rejected_before_payload_and_truncation_sticky() {
         }
         assert!(rx.read_owned(&mut input, read).await.is_err());
     }
-    for at in 0..36 {
+    for at in 0..40 {
         let (mut rx, _) = codecs(&[3; 32], false).unwrap();
         let mut bad = wire.clone();
         bad[at] ^= 1;

@@ -1,4 +1,4 @@
-use crate::{sniff::TlsRecords, Decoder, Encoded, Encoder, Protection};
+use crate::{sniff::TlsRecords, Decoder, Encoded, Encoder, Layout, Protection};
 use anyhow::{ensure, Result};
 use bytes::Bytes;
 use futures::{Sink, Stream};
@@ -52,30 +52,27 @@ impl Message {
     }
 }
 enum Phase {
-    Detecting(TlsRecords),
+    /// Before and after the passthrough latch: record headers are followed.
+    Records(TlsRecords),
     Full,
-    Passthrough,
 }
 struct Session {
     id: u32,
     phase: Phase,
 }
 impl Session {
-    fn protection(&mut self, payload: &[u8]) -> Protection {
+    fn protection(&mut self, payload: &[u8]) -> (Protection, Layout) {
         match &mut self.phase {
-            Phase::Passthrough => Protection::TlsPassthrough,
-            Phase::Full => Protection::Full,
-            Phase::Detecting(sniff) => {
-                let pass = sniff.encrypted_chunk(payload);
-                if sniff.passthrough {
-                    self.phase = Phase::Passthrough;
-                } else if sniff.failed() {
+            Phase::Full => (Protection::Full, Layout::default()),
+            Phase::Records(records) => {
+                let (pass, layout) = records.classify(payload);
+                if records.failed() {
                     self.phase = Phase::Full;
                 }
                 if pass {
-                    Protection::TlsPassthrough
+                    (Protection::TlsPassthrough, layout)
                 } else {
-                    Protection::Full
+                    (Protection::Full, Layout::default())
                 }
             }
         }
@@ -146,18 +143,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
         ));
         Ok(t)
     }
-    fn protection(&mut self, id: u32, payload: &[u8]) -> Protection {
+    fn protection(&mut self, id: u32, payload: &[u8]) -> (Protection, Layout) {
         let slot = self
             .classifiers
             .entry(id as u16)
             .or_insert_with(|| Session {
                 id,
-                phase: Phase::Detecting(TlsRecords::default()),
+                phase: Phase::Records(TlsRecords::default()),
             });
         if slot.id != id {
             *slot = Session {
                 id,
-                phase: Phase::Detecting(TlsRecords::default()),
+                phase: Phase::Records(TlsRecords::default()),
             };
         }
         slot.protection(payload)
@@ -178,38 +175,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
         // Incoming half-close does not reset our independently active direction.
     }
     fn prepare(&mut self, msg: Message) -> Result<Encoded> {
-        let (cmd, id, mode, payload) = match msg {
+        let (cmd, id, mode, layout, payload) = match msg {
             Message::DataFrame { .. } | Message::DataChunks { .. } => {
                 anyhow::bail!("DataChunks is a receive-only complete frame")
             }
             Message::Data { id, payload } => {
-                let mode = self.protection(id, &payload);
-                (crate::DATA, id, mode, payload)
+                let (mode, layout) = self.protection(id, &payload);
+                (crate::DATA, id, mode, layout, payload)
             }
             Message::Binary(b) => {
                 if b.len() >= 5 && b[0] == 1 {
                     let id = u32::from(u16::from_le_bytes([b[1], b[2]]))
                         | (u32::from(u16::from_le_bytes([b[3], b[4]])) << 16);
                     let data = b.slice(5..);
-                    let mode = self.protection(id, &data);
-                    (crate::DATA, id, mode, data)
+                    let (mode, layout) = self.protection(id, &data);
+                    (crate::DATA, id, mode, layout, data)
                 } else {
                     self.control(&b, true);
-                    (crate::L5, 0, Protection::Full, b)
+                    (crate::L5, 0, Protection::Full, Layout::default(), b)
                 }
             }
-            Message::Ping(b) => (crate::PING, 0, Protection::Full, b),
+            Message::Ping(b) => (crate::PING, 0, Protection::Full, Layout::default(), b),
             Message::Pong(b) => {
                 self.pongs.retain(|p| p != &b);
-                (crate::PONG, 0, Protection::Full, b)
+                (crate::PONG, 0, Protection::Full, Layout::default(), b)
             }
-            Message::Close(_) => (crate::CLOSE, 0, Protection::Full, Bytes::new()),
+            Message::Close(_) => (crate::CLOSE, 0, Protection::Full, Layout::default(), Bytes::new()),
         };
         #[cfg(feature = "size-diagnostics")]
         if cmd == crate::DATA {
             crate::diagnostics::record(5, payload.len());
         }
-        self.tx.prepare(cmd, id, mode, payload)
+        self.tx.prepare_layout(cmd, id, mode, payload, layout)
     }
     pub fn write_notify(&self) -> std::sync::Arc<tokio::sync::Notify> { self.write_notify.clone() }
     pub fn set_write_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) { self.write_notify=notify; }
@@ -406,39 +403,55 @@ mod session_tests {
     fn transport() -> Transport<tokio::io::DuplexStream> {
         Transport::new(tokio::io::duplex(4096).0, &[1; 32], true).unwrap()
     }
+    fn rec(n: usize) -> Vec<u8> {
+        let mut v = vec![23, 3, 3, (n >> 8) as u8, n as u8];
+        v.extend(std::iter::repeat_n(9, n));
+        v
+    }
+    fn mode(t: &mut Transport<tokio::io::DuplexStream>, id: u32, b: &[u8]) -> Protection {
+        t.protection(id, b).0
+    }
     #[test]
-    fn latch_bypasses_parser_and_reuse_resets_both_control_directions() {
+    fn latch_follows_records_and_reuse_resets_both_control_directions() {
         for outgoing in [true, false] {
             let mut t = transport();
             let id = 0x10001;
-            assert_eq!(t.protection(id, &hello()), Protection::Full);
+            assert_eq!(mode(&mut t, id, &hello()), Protection::Full);
             assert_eq!(
                 t.protection(id, &[23, 3, 3, 0, 20]),
-                Protection::TlsPassthrough
+                (Protection::TlsPassthrough, Layout { cont: 0, skip: Some(0) })
             );
-            assert!(matches!(t.classifiers[&1].phase, Phase::Passthrough));
+            assert_eq!(t.protection(id, &[7; 20]), (Protection::TlsPassthrough, Layout::default()));
             for _ in 0..100 {
+                let mut two = rec(30);
+                two.extend(rec(17));
                 assert_eq!(
-                    t.protection(id, b"not a TLS record; no sniff"),
-                    Protection::TlsPassthrough
+                    t.protection(id, &two),
+                    (Protection::TlsPassthrough, Layout { cont: 0, skip: Some(0) })
                 );
             }
             t.control(&control(4, id), false);
-            assert_eq!(t.protection(id, b"body"), Protection::TlsPassthrough);
+            assert_eq!(mode(&mut t, id, &rec(40)), Protection::TlsPassthrough);
             t.control(&control(6, 0x20001), outgoing);
-            assert_eq!(t.protection(id, b"body"), Protection::TlsPassthrough);
+            assert_eq!(mode(&mut t, id, &rec(40)), Protection::TlsPassthrough);
             t.control(&control(3, id), outgoing);
             assert!(!t.classifiers.contains_key(&1));
-            assert_eq!(t.protection(id, b"GET /"), Protection::Full);
+            assert_eq!(mode(&mut t, id, b"GET /"), Protection::Full);
             t.control(&control(2, id), outgoing);
-            assert_eq!(t.protection(id, &hello()), Protection::Full);
-            assert_eq!(
-                t.protection(id, &[23, 3, 3, 0, 20]),
-                Protection::TlsPassthrough
-            );
-            assert_eq!(t.protection(0x20001, b"GET /"), Protection::Full);
+            assert_eq!(mode(&mut t, id, &hello()), Protection::Full);
+            assert_eq!(mode(&mut t, id, &[23, 3, 3, 0, 20]), Protection::TlsPassthrough);
+            assert_eq!(mode(&mut t, 0x20001, b"GET /"), Protection::Full);
             assert_eq!(t.classifiers.len(), 1);
         }
+    }
+    #[test]
+    fn framing_violation_after_latch_falls_back_to_full() {
+        let mut t = transport();
+        assert_eq!(mode(&mut t, 1, &hello()), Protection::Full);
+        assert_eq!(mode(&mut t, 1, &rec(20)), Protection::TlsPassthrough);
+        assert_eq!(mode(&mut t, 1, b"not a TLS record; no sniff"), Protection::Full);
+        assert!(matches!(t.classifiers[&1].phase, Phase::Full));
+        assert_eq!(mode(&mut t, 1, &rec(20)), Protection::Full);
     }
     #[test]
     fn mixed_transition_and_opposite_direction_stay_protected() {
@@ -447,13 +460,15 @@ mod session_tests {
         let id = 7;
         let mut mixed = hello();
         mixed.extend([23, 3, 3, 0, 20]);
-        mixed.extend([8; 20]);
-        assert_eq!(t.protection(id, &mixed), Protection::Full);
+        mixed.extend([8; 10]);
+        assert_eq!(mode(&mut t, id, &mixed), Protection::Full);
+        let mut rest = vec![8; 10];
+        rest.extend(rec(18));
         assert_eq!(
-            t.protection(id, b"continuation"),
-            Protection::TlsPassthrough
+            t.protection(id, &rest),
+            (Protection::TlsPassthrough, Layout { cont: 0, skip: Some(10) })
         );
-        assert_eq!(other.protection(id, b"plaintext"), Protection::Full);
-        assert_eq!(other.protection(id, &mixed), Protection::Full);
+        assert_eq!(mode(&mut other, id, b"plaintext"), Protection::Full);
+        assert_eq!(mode(&mut other, id, &mixed), Protection::Full);
     }
 }
