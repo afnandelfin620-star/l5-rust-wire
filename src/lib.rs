@@ -156,8 +156,12 @@ fn nonce(seq: u64) -> aead::Nonce {
     n[4..].copy_from_slice(&seq.to_be_bytes());
     aead::Nonce::assume_unique_for_key(n)
 }
+/// One reusable allocation for FULL payloads that cannot be encrypted in place
+/// (pbuf/lease-backed Bytes). Frames are carved from it sequentially, so a
+/// batch of pending frames shares it; it is rewound once they are all written.
+const ARENA: usize = 512 * 1024;
 pub struct Encoder {
-    scratch: BytesMut,
+    arena: BytesMut,
     keys: Keys,
     seq: u64,
 }
@@ -197,11 +201,36 @@ pub struct Encoded {
     /// Masked replacements for inner TLS record headers of a borrowed payload.
     masks: [Mask; INLINE_MASKS],
     mask_count: usize,
-    /// Payload storage came from the encoder scratch and may be reclaimed.
+    /// Payload storage was carved from the encoder arena.
     scratch: bool,
 }
 impl Encoded {
-    pub(crate) fn written(&self) -> usize { self.offset }
+    /// Total encoded bytes of this frame.
+    pub(crate) fn total(&self) -> usize { self.header.len() + self.payload.len() + self.tag_len }
+    /// Bytes not yet written.
+    pub(crate) fn remaining(&self) -> usize { self.total() - self.offset }
+    pub(crate) fn advance(&mut self, n: usize) { self.offset += n; }
+    /// Upper bound of IoSlices this frame contributes.
+    pub(crate) fn slice_count(&self) -> usize { 2 * self.mask_count + 3 }
+    /// Append this frame's unwritten bytes as descriptors. Returns false when
+    /// `out` filled up before the frame ended.
+    pub(crate) fn push_slices<'a>(&'a self, out: &mut [IoSlice<'a>], count: &mut usize) -> bool {
+        let (parts, n) = self.parts();
+        let mut skip = self.offset;
+        for part in parts.into_iter().take(n) {
+            if skip >= part.len() {
+                skip -= part.len();
+                continue;
+            }
+            if *count == out.len() {
+                return false;
+            }
+            out[*count] = IoSlice::new(&part[skip..]);
+            skip = 0;
+            *count += 1;
+        }
+        true
+    }
     /// Logical frame parts: header, payload with masked header substitutions, tag.
     fn parts(&self) -> ([&[u8]; 2 * INLINE_MASKS + 3], usize) {
         let mut parts: [&[u8]; 2 * INLINE_MASKS + 3] = [&[]; 2 * INLINE_MASKS + 3];
@@ -274,19 +303,31 @@ pub fn codecs(root: &[u8], client: bool) -> Result<(Decoder, Encoder)> {
             streamed: 0,
         },
         Encoder {
-            scratch: BytesMut::new(),            keys: keys(root, send)?,
+            arena: BytesMut::new(),
+            keys: keys(root, send)?,
             seq: 0,
         },
     ))
 }
 impl Encoder {
+    /// A written frame is released. Once no arena frame remains alive the arena
+    /// is rewound to its start; `try_reclaim` never allocates.
     pub(crate) fn reclaim(&mut self, frame: Encoded) {
-        if frame.tag_len != 0 || frame.scratch {
-            if let Ok(mut buf) = frame.payload.try_into_mut() {
-                buf.clear();
-                if buf.capacity() > self.scratch.capacity() { self.scratch = buf; }
-            }
+        let arena = frame.scratch;
+        drop(frame);
+        if arena {
+            let _ = self.arena.try_reclaim(ARENA);
         }
+    }
+    /// Copy an immutable payload into the arena for in-place sealing/masking.
+    fn arena_copy(&mut self, src: &[u8]) -> BytesMut {
+        if self.arena.capacity() < src.len() && !self.arena.try_reclaim(src.len()) {
+            // Never used yet, or frames still pending occupy it: start a new
+            // block; the old one is freed when its last frame is written.
+            self.arena = BytesMut::with_capacity(ARENA.max(src.len()));
+        }
+        self.arena.extend_from_slice(src);
+        self.arena.split()
     }
 
     pub fn prepare(
@@ -341,14 +382,12 @@ impl Encoder {
             Protection::Full =>
             {
                 // Unique owned Bytes is encrypted in place; immutable pbuf-backed Bytes needs
-                // one copy only when full protection is required. No concatenation buffer.
+                // one copy (into the arena) only when full protection is required.
                 let mut buf = match payload.try_into_mut() {
                     Ok(buf) => buf,
                     Err(b) => {
-                        let mut buf = std::mem::take(&mut self.scratch);
-                        buf.clear();
-                        buf.extend_from_slice(&b);
-                        buf
+                        scratch = true;
+                        self.arena_copy(&b)
                     }
                 };
                 let tag = self
@@ -397,14 +436,11 @@ impl Encoder {
                 } else {
                     // Many tiny inner records: mask an owned buffer in place.
                     mask_count = 0;
-                    scratch = true;
                     let mut buf = match payload.try_into_mut() {
                         Ok(buf) => buf,
                         Err(b) => {
-                            let mut buf = std::mem::take(&mut self.scratch);
-                            buf.clear();
-                            buf.extend_from_slice(&b);
-                            buf
+                            scratch = true;
+                            self.arena_copy(&b)
                         }
                     };
                     let mut failure = None;
@@ -749,6 +785,22 @@ mod scratch_reuse_tests {
             address=Some(frame.payload.as_ptr());
             encoder.reclaim(frame);
             assert!(input.iter().all(|b|*b==7));
+        }
+    }
+    #[test]
+    fn pending_full_frames_share_one_arena_and_rewind_after_release() {
+        let (_,mut encoder)=codecs(&[9;32],true).unwrap();
+        let input=Bytes::from(vec![7;1000]);
+        let mut first=None;
+        for _ in 0..3 {
+            let frames:Vec<_>=(0..64).map(|_|encoder.prepare(DATA,1,Protection::Full,input.clone()).unwrap()).collect();
+            let base=frames[0].payload.as_ptr();
+            for (i,f) in frames.iter().enumerate() {
+                assert_eq!(f.payload.as_ptr(),base.wrapping_add(i*1000),"frames carved from one block");
+            }
+            if let Some(p)=first {assert_eq!(base,p,"arena rewound, no new allocation");}
+            first=Some(base);
+            for f in frames {encoder.reclaim(f);}
         }
     }
 }

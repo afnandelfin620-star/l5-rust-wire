@@ -5,6 +5,7 @@ use futures::{Sink, Stream};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
+    io::IoSlice,
     pin::Pin,
     task::{ready, Context, Poll},
 };
@@ -111,7 +112,10 @@ pub struct Transport<S> {
     read_owned: Option<fn(&mut S, &mut Context<'_>) -> Poll<std::io::Result<Bytes>>>,
     rx: Decoder,
     tx: Encoder,
-    pending: Option<Encoded>,
+    /// Encoded frames not yet fully written; one vectored write covers them all.
+    pending: VecDeque<Encoded>,
+    pending_bytes: usize,
+    pending_slices: usize,
     pongs: VecDeque<Bytes>,
     classifiers: HashMap<u16, Session>,
     closed: bool,
@@ -131,7 +135,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
             read_owned: None,
             rx,
             tx,
-            pending: None,
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            pending_slices: 0,
             pongs: VecDeque::new(),
             classifiers: HashMap::new(),
             closed: false,
@@ -259,40 +265,90 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
         Poll::Pending
     }
     fn drain_controls(&mut self,cx:&mut Context<'_>)->Poll<Result<()>> {
-        ready!(self.drain(cx))?;
         while let Some(pong)=self.pongs.pop_front() {
-            self.pending=Some(self.prepare(Message::Pong(pong))?);
-            ready!(self.drain(cx))?;
-        }
-        Poll::Ready(Ok(()))
-    }
-    fn drain(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.pending.is_some() {
-            self.start_write_wait();
-            let p=self.pending.as_mut().unwrap();
-            let before=p.written();
-            let result=p.poll_write(&mut self.io,cx);
-            let progress=p.written()!=before;
-            match result {
-                Poll::Pending=>return self.pending_write(progress,cx),
-                Poll::Ready(result)=>result?,
+            if !self.has_room() {
+                // Frames stay queued on Pending; the popped Pong is queued below
+                // only after room exists, so push it back first.
+                self.pongs.push_front(pong);
+                ready!(self.drain(cx))?;
+                continue;
             }
-            self.write_deadline=None;
-            let completed=self.pending.take().unwrap();
-            self.tx.reclaim(completed);
+            let frame=self.prepare(Message::Pong(pong))?;
+            self.push(frame);
         }
+        self.drain(cx)
+    }
+    /// Whether one more frame may join the current batch.
+    fn has_room(&self) -> bool {
+        self.pending.len() < BATCH_FRAMES
+            && self.pending_bytes < BATCH_BYTES
+            && self.pending_slices + MAX_FRAME_SLICES <= BATCH_SLICES
+    }
+    fn push(&mut self, frame: Encoded) {
+        self.pending_bytes += frame.remaining();
+        self.pending_slices += frame.slice_count();
+        self.pending.push_back(frame);
+    }
+    /// Write every pending frame. All of them fit one descriptor array, so the
+    /// IO sees the whole batch at once and may pack TLS records across frames.
+    fn drain(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.pending.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        self.start_write_wait();
+        let mut progress = false;
+        while !self.pending.is_empty() {
+            let mut slices = [IoSlice::new(&[]); BATCH_SLICES];
+            let mut count = 0;
+            for frame in &self.pending {
+                if !frame.push_slices(&mut slices, &mut count) {
+                    break;
+                }
+            }
+            let mut n = match Pin::new(&mut self.io).poll_write_vectored(cx, &slices[..count]) {
+                Poll::Pending => return self.pending_write(progress, cx),
+                Poll::Ready(result) => result?,
+            };
+            if n == 0 {
+                return Poll::Ready(Err(anyhow::anyhow!("zero write")));
+            }
+            progress = true;
+            self.pending_bytes -= n;
+            while n != 0 {
+                let front = self.pending.front_mut().expect("written beyond batch");
+                let left = front.remaining();
+                if n < left {
+                    front.advance(n);
+                    break;
+                }
+                n -= left;
+                let done = self.pending.pop_front().unwrap();
+                self.pending_slices -= done.slice_count();
+                self.tx.reclaim(done);
+            }
+        }
+        self.write_deadline=None;
         Poll::Ready(Ok(()))
     }
 
 }
+/// Batch bounds: frames, bytes and descriptors per vectored write.
+const BATCH_FRAMES: usize = 64;
+const BATCH_BYTES: usize = 256 * 1024;
+const BATCH_SLICES: usize = 512;
+const MAX_FRAME_SLICES: usize = 2 * crate::INLINE_MASKS + 3;
 impl<S: AsyncRead + AsyncWrite + Unpin> Sink<Message> for Transport<S> {
     type Error = anyhow::Error;
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.has_room() {
+            return Poll::Ready(Ok(()));
+        }
         self.drain(cx)
     }
     fn start_send(mut self: Pin<&mut Self>, msg: Message) -> Result<()> {
-        ensure!(self.pending.is_none(), "sink not ready");
-        self.pending = Some(self.prepare(msg)?);
+        ensure!(self.has_room(), "sink not ready");
+        let frame = self.prepare(msg)?;
+        self.push(frame);
         Ok(())
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
